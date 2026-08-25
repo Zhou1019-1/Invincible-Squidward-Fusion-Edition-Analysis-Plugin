@@ -11,6 +11,7 @@ from .file_token import (
     register_files_with_token_service,
 )
 from .parse_record import ParseRecordManager
+from .banned_users import BannedUserManager
 
 __all__ = [
     "cleanup_file",
@@ -23,4 +24,5 @@ __all__ = [
     "register_files_with_token_service",
     "register_file_with_token_service",
     "ParseRecordManager",
+    "BannedUserManager",
 ]

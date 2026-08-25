@@ -10,7 +10,7 @@ import aiohttp
 from .core.logger import logger
 
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.message_components import Reply
+from astrbot.api.message_components import At, Reply
 from astrbot.api.star import Context, Star, register
 from astrbot.core.star.filter.event_message_type import EventMessageType
 
@@ -18,6 +18,7 @@ from .core.parser import ParserManager
 from .core.parser.utils import extract_url_from_card_data
 from .core.downloader import DownloadManager
 from .core.storage import (
+    BannedUserManager,
     cleanup_expired_marked_in,
     cleanup_files,
     cleanup_marked_in,
@@ -94,6 +95,12 @@ class VideoParserPlugin(Star):
             same_link_window_seconds=rate_limit.same_link.window_seconds,
             same_user_max_count=rate_limit.same_user.max_count,
             same_user_window_seconds=rate_limit.same_user.window_seconds,
+        )
+        self.banned_user_manager = BannedUserManager(
+            record_file=str(
+                Path(Config.build_runtime_dir(cfg.download.cache_dir, "permissions"))
+                / "banned_users.json"
+            ),
         )
         self.admin_cookie_assist = BilibiliAdminCookieAssistManager(
             context=self.context,
@@ -780,6 +787,80 @@ class VideoParserPlugin(Star):
                     self._active_media_flows - 1,
                 )
 
+    BAN_COMMAND = "#禁用解析"
+    UNBAN_COMMAND = "#恢复解析"
+
+    def _extract_ban_target_id(self, event: AstrMessageEvent, keyword: str) -> str:
+        """从 @ 组件或指令文本中提取目标用户 ID。"""
+        self_id = str(event.get_self_id() or "").strip()
+        chain = getattr(event.message_obj, "message", None) or []
+        for comp in chain:
+            if isinstance(comp, At):
+                target = str(getattr(comp, "qq", "") or "").strip()
+                if target and target.lower() != "all" and target != self_id:
+                    return target
+        rest = (event.message_str or "").replace(keyword, "", 1)
+        digits = "".join(c if c.isdigit() else " " for c in rest).split()
+        for token in digits:
+            if len(token) >= 4:
+                return token
+        return ""
+
+    def _match_ban_command(self, event: AstrMessageEvent):
+        """规范化消息文本后匹配屏蔽/恢复指令，返回 (keyword, ban) 或 None。"""
+        text = (event.message_str or "").strip().replace("＃", "#")
+        # 去掉开头的 @提及（如「@机器人 #禁用解析@某人」）
+        while text.startswith("@"):
+            _, _, text = text.partition(" ")
+            text = text.strip()
+        if text.startswith(self.BAN_COMMAND):
+            return self.BAN_COMMAND, True
+        if text.startswith(self.UNBAN_COMMAND):
+            return self.UNBAN_COMMAND, False
+        return None
+
+    async def _run_ban_command(
+        self, event: AstrMessageEvent, keyword: str, ban: bool
+    ):
+        """执行屏蔽/恢复指令，通过 yield 返回结果消息（官方插件的可靠回复方式）。"""
+        cfg = self.config_manager
+        if cfg.admin.debug_mode:
+            self.logger.debug(
+                f"命中屏蔽指令: {keyword}, 发送者={event.get_sender_id()}"
+            )
+
+        sender_id = str(event.get_sender_id() or "").strip()
+        if not (cfg.permission.admin_id and sender_id == cfg.permission.admin_id):
+            yield event.plain_result("仅管理员可以使用该指令。")
+            return
+
+        target_id = self._extract_ban_target_id(event, keyword)
+        if not target_id:
+            yield event.plain_result(
+                f"请使用「{keyword}@某用户」或「{keyword} QQ号」指定目标用户。"
+            )
+            return
+
+        user_key = BannedUserManager.build_user_key(
+            event.get_platform_name(), target_id
+        )
+        if ban:
+            changed = self.banned_user_manager.ban(user_key)
+            msg = (
+                f"已永久屏蔽用户 {target_id}，其消息将不再触发解析。"
+                if changed
+                else f"用户 {target_id} 已在屏蔽名单中。"
+            )
+        else:
+            changed = self.banned_user_manager.unban(user_key)
+            msg = (
+                f"已恢复用户 {target_id} 的解析权限。"
+                if changed
+                else f"用户 {target_id} 不在屏蔽名单中。"
+            )
+        logger.info(f"管理员 {sender_id} {'屏蔽' if ban else '恢复'}用户: {user_key}")
+        yield event.plain_result(msg)
+
     async def _handle_clean_cache(self, event: AstrMessageEvent):
         cache_dir = self.download_manager.cache_dir
         if not cache_dir:
@@ -846,7 +927,27 @@ class VideoParserPlugin(Star):
         if self_id and str(sender_id or "").strip() == self_id:
             return
 
+        matched = self._match_ban_command(event)
+        if matched is not None:
+            try:
+                async for result in self._run_ban_command(event, *matched):
+                    yield result
+            except Exception as exc:
+                self.logger.exception(f"屏蔽指令执行异常: {exc}")
+                yield event.plain_result(f"屏蔽指令执行失败: {exc}")
+            event.stop_event()
+            return
+
         if not cfg.permission.check(is_private, sender_id, group_id):
+            return
+
+        if self.banned_user_manager.is_banned(
+            BannedUserManager.build_user_key(
+                event.get_platform_name(), sender_id
+            )
+        ):
+            if cfg.admin.debug_mode:
+                self.logger.debug(f"用户 {sender_id} 已被管理员屏蔽，跳过解析")
             return
 
         original_message_text = event.message_str or ""
