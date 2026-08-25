@@ -1,6 +1,6 @@
 name: 无敌章鱼哥融合版解析插件
 desc: 无敌章鱼哥融合重制：12平台聚合解析 + B站/抖音直播、专栏、AI总结、CDN优选、抖音BGM、超限转文件等增强能力
-version: 2.0.0
+version: 2.1.0
 astrbot_version: ">=4,<5"
 author: 无敌章鱼哥
 repo: https://github.com/Zhou1019-1/Invincible-Squidward-Fusion-Edition-Analysis-Plugin
